@@ -1,0 +1,7 @@
+# Desktop UI
+PySide6
+
+# Optional: speech-based cuts and captions. Remove this line if you don't want Whisper.
+faster-whisper
+
+# FFmpeg and ffprobe are NOT pip packages. Install them separately: https://ffmpeg.org
