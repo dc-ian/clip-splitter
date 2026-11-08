@@ -7,13 +7,15 @@ clipper_ui.py - Phase 4: desktop window for clipper.py
 
 Keep clipper.py in the same folder. FFmpeg must be on your PATH.
 Optional: pip install faster-whisper   (sentence-end cuts)
+Optional: pip install yt-dlp           (paste a YouTube link instead of opening a file)
 
-Flow:  drop a video -> Analyze -> review/fix the clip list -> Export
+Flow:  drop a video (or paste a YouTube link) -> Analyze -> review/fix the clip list -> Export
   * clips that ended on a hard cut (no pause/scene/sentence found) are orange: check those first
   * click a clip to preview it; trim, merge, delete or re-export single clips
   * Export only re-encodes what changed (finished clips are kept)
   * Fast / Precise toggle (Fast = instant but keyframe-accurate only)
   * Captions (burned / .srt), 9:16 reframing and "best N clips only" in the Export options box
+  * Ranking video: after Export, join the best N clips as a #N ... #1 countdown with rank badges
   * Cancel works at every stage, including Analyze
 
 Package later with:  pyinstaller --noconsole --onefile clipper_ui.py
@@ -95,6 +97,60 @@ class Worker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class DownloadWorker(QThread):
+    """Downloads one online video off the GUI thread. Stop it with cancel_event."""
+    log = Signal(str)
+    progress = Signal(int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.cancel_event = threading.Event()
+
+    def _on_progress(self, e):
+        self.progress.emit(int(e.get("pct", 0)), e.get("text", ""))
+
+    def run(self):
+        try:
+            with contextlib.redirect_stdout(_LineWriter(self.log.emit)):
+                path = clipper.download_video(self.url, progress=self._on_progress, cancel=self.cancel_event)
+            self.done.emit(path)
+        except clipper.ClipperError as e:
+            self.failed.emit(str(e))
+        except Exception as e:  # never let a thread die silently
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class RankWorker(QThread):
+    """Builds the countdown (ranking) video from the exported clips, off the GUI thread."""
+    log = Signal(str)
+    progress = Signal(int, int)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, out_dir, top, title):
+        super().__init__()
+        self.out_dir, self.top, self.title = out_dir, top, title
+        self.cancel_event = threading.Event()
+
+    def _on_event(self, e):
+        if e.get("stage") in ("rank_start", "rank_clip"):
+            self.progress.emit(int(e.get("done", 0)), int(e.get("total", 1)))
+
+    def run(self):
+        try:
+            with contextlib.redirect_stdout(_LineWriter(self.log.emit)):
+                path = clipper.run_ranking(self.out_dir, self.top, self.title or None,
+                                           progress=self._on_event, cancel=self.cancel_event)
+            self.done.emit(path)
+        except clipper.ClipperError as e:
+            self.failed.emit(str(e))
+        except Exception as e:  # never let a thread die silently
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -121,7 +177,7 @@ class MainWindow(QMainWindow):
         lv = QVBoxLayout(left)
 
         top = QHBoxLayout()
-        self.file_label = QLabel("Drop a video here, or press Open")
+        self.file_label = QLabel("Drop a video here, paste a link below, or press Open")
         self.file_label.setStyleSheet("border: 2px dashed #888; padding: 14px;")
         self.file_label.setAlignment(Qt.AlignCenter)
         self.btn_open = QPushButton("Open video...")
@@ -129,6 +185,19 @@ class MainWindow(QMainWindow):
         top.addWidget(self.file_label, 1)
         top.addWidget(self.btn_open)
         lv.addLayout(top)
+
+        dl = QHBoxLayout()
+        self.ed_url = QLineEdit()
+        self.ed_url.setPlaceholderText("Or paste a YouTube link here and press Enter")
+        self.ed_url.setClearButtonEnabled(True)
+        self.ed_url.returnPressed.connect(self.on_download)
+        self.btn_dl = QPushButton("Download")
+        self.btn_dl.clicked.connect(self.on_download)
+        if not clipper.ytdlp_available():
+            self.ed_url.setPlaceholderText("Paste a link here (needs yt-dlp: pip install yt-dlp, then restart)")
+        dl.addWidget(self.ed_url, 1)
+        dl.addWidget(self.btn_dl)
+        lv.addLayout(dl)
 
         self.settings = QGroupBox("Settings")
         g = QGridLayout(self.settings)
@@ -187,6 +256,21 @@ class MainWindow(QMainWindow):
         mv.addLayout(og)
         lv.addWidget(mode)
 
+        self.rank_box = QGroupBox("Ranking video (countdown template)")
+        self.rank_box.setToolTip("Picks the best exported clips by highlight score and joins them as a countdown, "
+                                 "#N down to #1, with a rank badge, a title and a tracker on every clip. "
+                                 "Export first.")
+        rl = QHBoxLayout(self.rank_box)
+        self.sp_rank = QSpinBox()
+        self.sp_rank.setRange(1, 20); self.sp_rank.setValue(5)
+        self.sp_rank.setPrefix("Top "); self.sp_rank.setSuffix(" moments")
+        self.ed_rank_title = QLineEdit()
+        self.ed_rank_title.setPlaceholderText("Title (default: TOP N MOMENTS)")
+        self.btn_rank = QPushButton("3. Make ranking video")
+        self.btn_rank.clicked.connect(self.on_rank)
+        rl.addWidget(self.sp_rank); rl.addWidget(self.ed_rank_title, 1); rl.addWidget(self.btn_rank)
+        lv.addWidget(self.rank_box)
+
         btns = QHBoxLayout()
         self.btn_analyze = QPushButton("1. Analyze"); self.btn_analyze.clicked.connect(self.on_analyze)
         self.btn_export = QPushButton("2. Export clips"); self.btn_export.clicked.connect(self.on_export)
@@ -228,6 +312,8 @@ class MainWindow(QMainWindow):
         self.video.setMinimumHeight(260)
         self.player.setVideoOutput(self.video)
         self.player.positionChanged.connect(self.on_position)
+        self.player.errorOccurred.connect(
+            lambda err, msg: self._set_status(f"Preview problem: {msg or err}. Export still works.", warn=True))
         rv.addWidget(self.video, 1)
 
         pr = QHBoxLayout()
@@ -286,8 +372,13 @@ class MainWindow(QMainWindow):
             pending = clipper.pending_clips(self.manifest, self.out_dir,
                                             clipper.render_signature(args), clipper.wants_sidecar(args))
             can_export = bool(pending) and self._settings_match(args)
+        exported = bool(has_plan and self.out_dir is not None and any(
+            c.get("done") and (self.out_dir / c["file"]).exists() for c in clipper.live_clips(self.manifest)))
+        self.rank_box.setEnabled(exported and not busy)
         sel = self._selected() is not None
         self.btn_open.setEnabled(not busy)
+        self.ed_url.setEnabled(not busy)       # always pasteable; Download explains if yt-dlp is missing
+        self.btn_dl.setEnabled(not busy)
         self.btn_analyze.setEnabled(has_src and not busy)
         self.btn_export.setEnabled(can_export)
         self.btn_cancel.setEnabled(busy)
@@ -379,13 +470,22 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ file handling
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        if e.mimeData().hasUrls() or e.mimeData().hasText():
             e.acceptProposedAction()
 
     def dropEvent(self, e):
-        urls = e.mimeData().urls()
-        if urls and not self._busy():
+        if self._busy():
+            return
+        md = e.mimeData()
+        urls = md.urls()
+        if urls and urls[0].scheme() in ("http", "https"):          # a link dragged from a browser
+            self.ed_url.setText(urls[0].toString())
+            self.on_download()
+        elif urls:
             self.set_source(Path(urls[0].toLocalFile()))
+        elif md.hasText() and clipper.is_url(md.text().strip()):
+            self.ed_url.setText(md.text().strip())
+            self.on_download()
 
     def on_open(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open video", "", "Video files (*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.flv *.ts *.wmv);;All files (*)")
@@ -403,6 +503,88 @@ class MainWindow(QMainWindow):
         self.out_label.setText(f"Output folder: {self.out_dir}")
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self._set_status("Press Analyze to find the cut points.")
+        self._update_buttons()
+
+    def on_download(self):
+        if self._busy():
+            return
+        url = self.ed_url.text().strip()
+        if not url:
+            return
+        if not clipper.is_url(url):
+            QMessageBox.warning(self, "Not a link", "Paste a full web link, starting with http:// or https://")
+            return
+        if not clipper.ytdlp_available():
+            QMessageBox.warning(self, "yt-dlp missing", "Downloading links needs yt-dlp in the Python that runs this app:\n\n    "
+                                + sys.executable + " -m pip install yt-dlp\n\nThen restart the app.")
+            return
+        self.worker = DownloadWorker(url)
+        self.worker.log.connect(self._on_log)
+        self.worker.progress.connect(self._on_dl_progress)
+        self.worker.done.connect(self._on_dl_done)
+        self.worker.failed.connect(self._on_dl_failed)
+        self.progress.setRange(0, 0)          # busy indicator until the first percentage arrives
+        self._set_status("Downloading... (saved to " + str(clipper.default_download_dir()) + ")")
+        self.worker.start()
+        self._update_buttons()
+
+    def _on_dl_progress(self, pct, text):
+        if self.progress.maximum() == 0:
+            self.progress.setRange(0, 100)
+        self.progress.setValue(pct)
+        if text:
+            self._set_status(text)
+
+    def _on_dl_done(self, path):
+        self.worker.wait()                    # the thread is just returning; makes the buttons update correctly
+        self.progress.setRange(0, 1); self.progress.setValue(0)
+        self.ed_url.clear()
+        path = Path(path)
+        self.set_source(path)
+        if self.src == path:
+            self._set_status(f"Downloaded {path.name}. Press Analyze to find the cut points.")
+        self._update_buttons()
+
+    def _on_dl_failed(self, msg):
+        self.worker.wait()
+        self.progress.setRange(0, 1); self.progress.setValue(0)
+        self._set_status(msg, warn=True)
+        if not msg.startswith("Cancelled") and self.isVisible():
+            QMessageBox.critical(self, "Download failed", msg)
+        self._update_buttons()
+
+    def on_rank(self):
+        if self._busy() or self.manifest is None:
+            return
+        self.worker = RankWorker(self.out_dir, self.sp_rank.value(), self.ed_rank_title.text().strip())
+        self.worker.log.connect(self._on_log)
+        self.worker.progress.connect(self._on_rank_progress)
+        self.worker.done.connect(self._on_rank_done)
+        self.worker.failed.connect(self._on_rank_failed)
+        self.progress.setRange(0, 0)
+        self._set_status("Making the ranking video...")
+        self.worker.start()
+        self._update_buttons()
+
+    def _on_rank_progress(self, done, total):
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(done)
+        self._set_status(f"Ranking video: {done} of {total} clips drawn")
+
+    def _on_rank_done(self, path):
+        self.worker.wait()
+        self.manifest = clipper.load_job(self.out_dir) or self.manifest   # clips may have been scored
+        self.progress.setRange(0, 1); self.progress.setValue(1)
+        self._set_status(f"Ranking video saved: {path}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        self._update_buttons()
+
+    def _on_rank_failed(self, msg):
+        self.worker.wait()
+        self.progress.setRange(0, 1); self.progress.setValue(0)
+        self._set_status(msg, warn=True)
+        if not msg.startswith("Cancelled") and self.isVisible():
+            QMessageBox.critical(self, "Ranking video failed", msg)
         self._update_buttons()
 
     def on_choose_out(self):
@@ -428,7 +610,7 @@ class MainWindow(QMainWindow):
         self._discard_plan()
         self.src = self.out_dir = None
         self.player.stop()
-        self.file_label.setText("Drop a video here, or press Open")
+        self.file_label.setText("Drop a video here, paste a link below, or press Open")
         self.out_label.setText("Output folder: (next to the video)")
         self._set_status("Ready.")
         self._update_buttons()

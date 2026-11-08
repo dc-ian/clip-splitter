@@ -34,12 +34,21 @@ Phase 1 features (still present):
   * JSON manifest written after every clip, so a crashed run resumes
   * temp/work files cleaned up on success (kept on crash so resume is fast)
 
+Ranking video (trending countdown template):
+  * --ranking 5 picks the 5 best clips by highlight score and joins them as a countdown (#5 ... #1),
+    each with a rank badge, a title and a 5 4 3 2 1 tracker burned in; saved as ranking_top5.mp4
+
+Online videos (optional, needs: pip install yt-dlp):
+  * pass a YouTube (or other yt-dlp supported) link instead of a file; it is downloaded to
+    --download-dir first, then clipped like any local video
+
 Requires: Python 3.8+, ffmpeg and ffprobe on PATH. No other dependencies.
 """
 import argparse
 import bisect
 import contextlib
 import gc
+import importlib.util
 import json
 import math
 import re
@@ -258,6 +267,119 @@ def say(msg):
     with _PRINT_LOCK:
         sys.stdout.write(msg + "\n")
         sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- download
+def is_url(text):
+    return bool(re.match(r"^https?://\S+$", str(text).strip(), re.I))
+
+
+def ytdlp_available():
+    return importlib.util.find_spec("yt_dlp") is not None
+
+
+def default_download_dir():
+    return Path.home() / "Downloads" / "ClipSplitter"
+
+
+class _YtdlpLog:
+    """Keeps yt-dlp quiet: only warnings and errors reach the log."""
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        say(f"yt-dlp: {msg}")
+
+    def error(self, msg):
+        say(f"yt-dlp: {msg}")
+
+
+def download_video(url, dest_dir=None, progress=None, cancel=None, max_height=1080):
+    """Download one online video (never a whole playlist) as an .mp4 and return its path.
+    progress(event: dict) gets {"stage": "download", "pct": 0-100, "text": "..."}.
+    Setting the cancel event stops the download. Running it again resumes a partial file."""
+    url = str(url).strip()
+    if not is_url(url):
+        raise ClipperError(f"That does not look like a web link: {url}")
+    if not ytdlp_available():
+        raise ClipperError("Downloading links needs yt-dlp. Install it with:  pip install yt-dlp")
+    need_tool("ffmpeg")      # yt-dlp uses it to join the separate video and audio streams
+    import yt_dlp
+    from yt_dlp.utils import DownloadCancelled
+
+    dest = Path(dest_dir) if dest_dir else default_download_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    emit = progress or (lambda e: None)
+
+    def hook(d):
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled("Cancelled.")
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            pct = int(done * 100 / total) if total else 0
+            speed = d.get("speed")
+            text = f"Downloading... {pct}%" + (f"  ({speed / 1e6:.1f} MB/s)" if speed else "")
+            emit({"stage": "download", "pct": min(pct, 100), "text": text})
+        elif d.get("status") == "finished":
+            emit({"stage": "download", "pct": 100, "text": "Download finished, joining audio and video..."})
+
+    opts = {
+        # prefer H.264 + AAC: it plays in the preview window; AV1/VP9 often do not
+        "format": (f"bv*[vcodec^=avc1][height<={max_height}]+ba[ext=m4a]/"
+                   f"bv*[height<={max_height}][vcodec!^=av01]+ba/b[height<={max_height}]/bv*+ba/b"),
+        "merge_output_format": "mp4",
+        "outtmpl": str(dest / "%(title).80B [%(id)s].%(ext)s"),
+        "restrictfilenames": False,
+        "windowsfilenames": True,
+        "noplaylist": True,
+        "continuedl": True,
+        "quiet": True,
+        "no_warnings": False,
+        "noprogress": True,
+        "logger": _YtdlpLog(),
+        "progress_hooks": [hook],
+    }
+    say(f"Downloading {url}")
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info and info.get("entries"):          # a playlist link: take its first video only
+                info = next((e for e in info["entries"] if e), None)
+            path, vid = None, None
+            if info:
+                for rd in info.get("requested_downloads") or []:
+                    if rd.get("filepath"):
+                        path = Path(rd["filepath"])
+                if path is None:
+                    path = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+                vid = info.get("id")
+    except DownloadCancelled:
+        raise Cancelled("Cancelled.")
+    except yt_dlp.utils.DownloadError as e:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("Cancelled.")
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "").strip()
+        raise ClipperError(f"Could not download that link: {msg}\n"
+                           "If this keeps happening, update yt-dlp (pip install -U yt-dlp).")
+    if cancel is not None and cancel.is_set():
+        raise Cancelled("Cancelled.")
+    if path is None or not path.is_file():            # the final name can differ from what yt-dlp reported
+        found = sorted(dest.glob(f"*[[]{vid}[]].mp4"), key=lambda p: p.stat().st_mtime) if vid else []
+        if not found:
+            raise ClipperError("The download finished but the video file was not found.")
+        path = found[-1]
+    say(f"Saved: {path}")
+    return path.resolve()
+
+
+def resolve_inputs(items, dest_dir=None, progress=None, cancel=None):
+    """Replace every web link in a list of inputs with the downloaded file; leave paths alone."""
+    return [str(download_video(i, dest_dir, progress, cancel)) if is_url(i) else i for i in items or []]
 
 
 def pass_rms(src):
@@ -1343,9 +1465,140 @@ def purge_clips(out_dir):
 
 
 # -------------------------------------------------------------------- main
+# --------------------------------------------------------------- ranking video
+RANK_NAME = "ranking_top{n}.mp4"
+
+
+def write_rank_ass(path, w, h, rank, total, title, dur, font="Arial", color="#FFD400"):
+    """Overlay for one clip of the countdown: title, big pop-in rank badge, and a 5 4 3 2 1 tracker."""
+    portrait = h > w
+    r, g, b = _hex_rgb(color, "FFD400")
+    accent_tag, accent_style = f"&H{b}{g}{r}&".upper(), f"&H00{b}{g}{r}".upper()
+    title_sz = max(14, round(h * (0.030 if portrait else 0.045)))
+    rank_sz = max(24, round(h * (0.085 if portrait else 0.14)))
+    rail_sz = max(12, round(h * (0.026 if portrait else 0.040)))
+    if portrait:
+        an, x = 8, round(w / 2)
+        y_title, y_rank, y_rail = round(h * 0.07), round(h * 0.10), round(h * 0.215)
+    else:
+        an, x = 7, round(w * 0.04)
+        y_title, y_rank, y_rail = round(h * 0.04), round(h * 0.085), round(h * 0.27)
+    clean = title.replace("\\", "").replace("{", "(").replace("}", ")").replace("\n", " ")
+    rail = "   ".join(("{\\1c" + (accent_tag if n == rank else "&HBBBBBB&") + "}" + str(n))
+                      for n in range(total, 0, -1))
+    pos = "\\an%d\\pos(%d,%d)"
+
+    def style(name, size, colour):
+        return (f"Style: {name},{font},{size},{colour},{colour},&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,"
+                f"{max(2, round(size * 0.08))},2,{an},0,0,0,1")
+
+    end = _ass_time(max(dur, 0.5))
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}",
+        "WrapStyle: 2", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+        "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        style("Title", title_sz, "&H00FFFFFF"),
+        style("Rank", rank_sz, accent_style),
+        style("Rail", rail_sz, "&H00FFFFFF"),
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        f"Dialogue: 0,0:00:00.00,{end},Title,,0,0,0,,{{" + pos % (an, x, y_title) + "\\fad(200,0)}" + clean,
+        f"Dialogue: 0,0:00:00.00,{end},Rank,,0,0,0,,{{" + pos % (an, x, y_rank)
+        + "\\fscx170\\fscy170\\t(0,250,\\fscx100\\fscy100)\\fad(80,0)}#" + str(rank),
+        f"Dialogue: 0,0:00:00.00,{end},Rail,,0,0,0,,{{" + pos % (an, x, y_rail) + "}" + rail,
+    ]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _make_ranking(out_dir, top, title, encoder, font, color, progress=None):
+    emit = progress or (lambda e: None)
+    out_dir = Path(out_dir).resolve()      # ffmpeg runs in another folder, so use full paths
+    need_tool("ffmpeg")
+    need_tool("ffprobe")
+    if not has_filter("ass"):
+        raise ClipperError("The ranking template draws its text with libass, which this FFmpeg build lacks. "
+                           "Install a 'full' FFmpeg build (for Windows: gyan.dev 'full').")
+    manifest = load_job(out_dir)
+    if manifest is None:
+        raise ClipperError("No clips found yet. Analyze and export first.")
+    cands = [c for c in live_clips(manifest) if c.get("done") and (out_dir / c["file"]).is_file()]
+    if not cands:
+        raise ClipperError("No exported clips yet. Press Export first, then make the ranking video.")
+    if any(c.get("h_score") is None for c in cands):
+        try:
+            score_clips(manifest, out_dir)
+            save_job(out_dir, manifest)
+        except Exception as e:  # scoring is a bonus: fall back to video order
+            print(f"  (could not score the clips, using video order: {type(e).__name__}: {e})")
+    cands.sort(key=lambda c: (-(c.get("h_score") or 0.0), c["index"]))
+    top = max(1, min(int(top or 5), len(cands)))
+    if len(cands) < 2:
+        print("Note: only one exported clip, so the ranking has a single entry.")
+    picked = cands[:top]                    # picked[0] is rank #1 (the best)
+    title = (title or "").strip() or f"TOP {top} MOMENTS"
+    enc_name, enc_args = pick_encoder(encoder)
+    work = out_dir / ".rank_work"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    print(f"\nRanking video: '{title}', {top} clip(s), encoder {enc_name}.")
+    emit({"stage": "rank_start", "done": 0, "total": top})
+    parts = []
+    try:
+        for done, rank in enumerate(range(top, 0, -1), start=1):      # countdown: #top ... #1
+            c = picked[rank - 1]
+            clip_path = (out_dir / c["file"]).resolve()
+            m = probe(clip_path)
+            ass_name = f"rank_{rank}.ass"
+            write_rank_ass(work / ass_name, m["width"], m["height"], rank, top, title, m["duration"], font, color)
+            part = (work / f"rank_{rank}.mp4").resolve()
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(clip_path), "-vf", f"ass=filename='{ass_name}'",
+                   *enc_args, "-pix_fmt", "yuv420p"]
+            cmd += ["-c:a", "aac", "-b:a", "160k"] if m["has_audio"] else ["-an"]
+            cmd += ["-movflags", "+faststart", "-f", "mp4", str(part)]
+            r = run(cmd, check=False, cwd=work)
+            if r.returncode != 0:
+                raise ClipperError(f"Could not draw rank #{rank} on {c['file']}:\n{r.stderr.strip()}")
+            parts.append(part)
+            score = c.get("h_score")
+            print(f"  #{rank}: {c['file']}" + (f"  (score {score:.0f})" if score is not None else ""))
+            emit({"stage": "rank_clip", "done": done, "total": top})
+        listing = work / "list.txt"
+        listing.write_text("".join("file '" + str(p).replace("\\", "/").replace("'", "'\\''") + "'\n"
+                                   for p in parts), encoding="utf-8")
+        out = out_dir / RANK_NAME.format(n=top)
+        tmp = out.with_name(out.name + ".part")
+        r = run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(listing.resolve()),
+                 "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp)], check=False, cwd=work)
+        if r.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            raise ClipperError(f"Could not join the ranking clips:\n{r.stderr.strip()}")
+        tmp.replace(out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"Saved: {out}")
+    return out
+
+
+def run_ranking(out_dir, top=5, title=None, encoder=None, font="Arial", color="#FFD400", progress=None, cancel=None):
+    """Make the countdown video from the clips already exported in out_dir. Returns its path.
+    progress(event) gets {"stage": "rank_clip", "done": n, "total": N}; set the cancel event to stop."""
+    global _CANCEL
+    _CANCEL = cancel
+    try:
+        return _make_ranking(out_dir, top, title, encoder, font, color, progress)
+    finally:
+        _CANCEL = None
+
+
 def build_parser():
     ap = argparse.ArgumentParser(description="Split a long video into 15-30 s clips at natural boundaries.")
-    ap.add_argument("input", nargs="*", help="video file(s) or folder(s); several = batch queue")
+    ap.add_argument("input", nargs="*",
+                    help="video file(s), folder(s) or YouTube/web links; several = batch queue")
+    ap.add_argument("--download-dir", default=None, metavar="DIR",
+                    help="where links are downloaded to (default: ~/Downloads/ClipSplitter). Needs: pip install yt-dlp")
     ap.add_argument("-o", "--out", default=None,
                     help="output folder (default: <input name>_clips). With several inputs: parent folder for all of them")
     ap.add_argument("--mode", choices=["smart", "fixed"], default="smart",
@@ -1385,6 +1638,10 @@ def build_parser():
     g.add_argument("--highlights-pct", type=float, default=None, metavar="P", help="export only the best P percent of clips")
     g.add_argument("--min-score", type=float, default=None, help="with the above: also require this highlight score (0-100)")
     g.add_argument("--highlight-keywords", default="", help="extra comma-separated words that make a clip more engaging")
+    rk = ap.add_argument_group("Ranking video (trending countdown template)")
+    rk.add_argument("--ranking", type=int, default=None, metavar="N",
+                    help="also make ranking_topN.mp4: the best N clips as a countdown (#N ... #1) with rank badges")
+    rk.add_argument("--ranking-title", default=None, help="title shown on every clip (default: TOP N MOMENTS)")
     q = ap.add_argument_group("Batch queue (several videos, crash-safe)")
     q.add_argument("--queue-file", default=None, help=f"queue file (default ./{QUEUE_NAME}); giving it turns batch mode on")
     q.add_argument("--resume-queue", action="store_true", help="continue the queue file without adding anything")
@@ -1417,6 +1674,8 @@ def main():
     ap = build_parser()
     args = ap.parse_args()
     try:
+        if any(is_url(i) for i in args.input):
+            args.input = resolve_inputs(args.input, args.download_dir)
         batch = (args.queue_status or args.resume_queue or args.queue_file or len(args.input) > 1
                  or any(Path(i).is_dir() for i in args.input))
         if batch:
@@ -1457,6 +1716,14 @@ def _run_job(args, progress=None, cancel=None):
         print("Note: --clip-len < 2 x --min-len, so smart cuts have very little room to choose from.")
     ro = render_options(args)
     hl_wanted = any(getattr(args, k, None) is not None for k in ("highlights", "highlights_pct", "min_score"))
+    ranking_n = getattr(args, "ranking", None)
+    if ranking_n is not None:
+        if ranking_n < 1:
+            raise ClipperError("--ranking must be 1 or more.")
+        if args.mode != "smart":
+            raise ClipperError("--ranking needs --mode smart (it ranks clips by highlight score).")
+        if not hl_wanted:                       # only the clips that can make the ranking need exporting
+            args.highlights, hl_wanted = ranking_n, True
     if ro["fast"] and (ro["burn"] or ro["reframe"] != "off"):
         raise ClipperError("Fast mode copies the video untouched, so it cannot burn in captions or reframe to 9:16. "
                            "Use Precise mode (sidecar .srt captions work in both).")
@@ -1641,6 +1908,12 @@ def _run_job(args, progress=None, cancel=None):
         print(f"  [{done_total:>4}/{total}] {c['file']}  {fmt_time(c['start'])} +{dur:4.1f}s  {c['signal']:<7} ETA {fmt_time(eta)}")
         emit({"stage": "clip_done", "done": done_total, "total": total, "index": c["index"]})
 
+    if ranking_n is not None:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("Cancelled. Press Export again to continue where you left off.")
+        _make_ranking(out_dir, ranking_n, getattr(args, "ranking_title", None), args.encoder,
+                      ro["cap_font"], ro["cap_color"], emit)
+
     # ---- clean up (only reached on success; on crash the work folder is kept for fast resume)
     shutil.rmtree(work_dir, ignore_errors=True)
     print(f"\nDone: {total} clips in '{out_dir}'.")
@@ -1654,7 +1927,7 @@ def _run_job(args, progress=None, cancel=None):
 # run_job resumes it from its own manifest.json (finished clips are never redone). One crash-looping file
 # cannot block the rest: after QUEUE_MAX_CRASHES interruptions it is marked failed.
 QUEUE_SKIP_OPTS = {"input", "out", "queue_file", "resume_queue", "retry_failed", "queue_status",
-                   "plan_only", "keep_work", "restart"}
+                   "plan_only", "keep_work", "restart", "download_dir"}
 
 
 def load_queue(path):
