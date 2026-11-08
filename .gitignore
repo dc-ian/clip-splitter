@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Clip Splitter output and work files
+*_clips/
+.work/
+clipper_queue.json
+clipper_queue.json.tmp
+clipper_queue.json.corrupt
+
+# Videos and generated media (never commit these)
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m4v
+*.flv
+*.ts
+*.wmv
+*.srt
+*.wav
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
